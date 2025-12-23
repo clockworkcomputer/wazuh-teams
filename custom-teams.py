@@ -6,7 +6,19 @@ import requests
 from datetime import datetime
 
 LOG_FILE = "/var/ossec/logs/integrations.log"
-USER_AGENT = "Wazuh-Teams-Integration/3.1"
+USER_AGENT = "Wazuh-Teams-Integration/3.8"
+
+DASHBOARD_BASE = "https://192.168.30.2"
+INDEX_PATTERN = "wazuh-alerts-*"
+
+# Bloque wrapped (como el que pegaste que te funciona)
+WRAPPED_TIME_FROM = "now-24h"
+WRAPPED_TIME_TO = "now"
+
+# Bloque final (el que quieres para no perder eventos antiguos)
+FINAL_TIME_FROM = "now-90d"
+FINAL_TIME_TO = "now"
+
 
 class Integration:
     def __init__(self, alert_file, webhook_url, min_level):
@@ -19,10 +31,7 @@ class Integration:
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(message)s",
-            handlers=[
-                logging.FileHandler(LOG_FILE),
-                logging.StreamHandler(sys.stdout),
-            ],
+            handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
         )
         self.logger = logging.getLogger("wazuh-teams")
 
@@ -35,10 +44,7 @@ class Integration:
             self.logger.error("Webhook URL not provided")
             return False
 
-        allowed_hosts = (
-            "environment.api.powerplatform.com",  # Power Automate workflows
-            "logic.azure.com",                    # Logic Apps style
-        )
+        allowed_hosts = ("environment.api.powerplatform.com", "logic.azure.com")
         if not any(h in self.webhook_url for h in allowed_hosts):
             self.logger.error(f"Invalid webhook URL: {self.webhook_url}")
             return False
@@ -57,7 +63,6 @@ class Integration:
         if not ts:
             return "N/A"
         try:
-            # Wazuh often uses +0000; convert to +00:00 for fromisoformat
             if len(ts) > 5 and (ts[-5] in ["+", "-"]) and ts[-2:].isdigit():
                 ts_fixed = ts[:-2] + ":" + ts[-2:]
             else:
@@ -68,26 +73,111 @@ class Integration:
             return ts
 
     def _priority(self, lvl: int):
-        if lvl >= 12: return ("CRITICAL", "Attention")
-        if lvl >= 7:  return ("HIGH", "Warning")
-        if lvl >= 4:  return ("MEDIUM", "Good")
+        if lvl >= 12:
+            return ("CRITICAL", "Attention")
+        if lvl >= 7:
+            return ("HIGH", "Warning")
+        if lvl >= 4:
+            return ("MEDIUM", "Good")
         return ("LOW", "Accent")
+
+    def _rison_escape(self, s: str) -> str:
+        # id va entre comillas simples en Rison -> duplicamos ' si apareciera
+        if s is None:
+            return ""
+        return str(s).replace("'", "''").strip()
+
+    def _build_filter_a(self, wazuh_id: str) -> str:
+        # Devuelve el contenido de _a=(...) SIN prefijo "_a=" para poder reutilizarlo
+        return (
+            "(filters:!(("
+            "'$state':(store:appState),"
+            "meta:("
+            "alias:!n,"
+            "disabled:!f,"
+            f"index:'{INDEX_PATTERN}',"
+            "key:id,"
+            "negate:!f,"
+            f"params:(query:'{wazuh_id}'),"
+            "type:phrase"
+            "),"
+            f"query:(match_phrase:(id:'{wazuh_id}'))"
+            ")),"
+            "query:(language:kuery,query:''))"
+        )
+
+    def _build_g(self, time_from: str, time_to: str) -> str:
+        return f"(filters:!(),refreshInterval:(pause:!t,value:0),time:(from:{time_from},to:{time_to}))"
+
+    def _build_dashboard_url(self, alert: dict) -> str:
+        wazuh_id = self._rison_escape(alert.get("id", ""))
+        if not wazuh_id:
+            # Si no hay id, mandamos a general con 90d (sin duplicados)
+            return (
+                f"{DASHBOARD_BASE}/app/threat-hunting#/overview/?tab=general&tabView=events"
+                f"&_a=(filters:!(),query:(language:kuery,query:''))"
+                f"&_g={self._build_g(FINAL_TIME_FROM, FINAL_TIME_TO)}"
+            )
+
+        a_filter = self._build_filter_a(wazuh_id)
+
+        # 1) Bloque wrapped EXACTO: &(_a=... )&(_g=... )
+        wrapped = (
+            f"&(_a={a_filter})"
+            f"&(_g={self._build_g(WRAPPED_TIME_FROM, WRAPPED_TIME_TO)})"
+        )
+
+        # 2) Bloque final EXACTO: &_a=...&_g=...
+        final = (
+            f"&_a={a_filter}"
+            f"&_g={self._build_g(FINAL_TIME_FROM, FINAL_TIME_TO)}"
+        )
+
+        # OJO: NO añadimos nunca _a/_g vacíos
+        return (
+            f"{DASHBOARD_BASE}/app/threat-hunting#/overview/?tab=general&tabView=events"
+            f"{wrapped}"
+            f"{final}"
+        )
 
     def _make_payload(self, alert: dict) -> dict:
         rule = alert.get("rule", {}) or {}
         agent = alert.get("agent", {}) or {}
+        data = alert.get("data", {}) or {}
 
         lvl = int(rule.get("level", 0))
         pr_txt, pr_clr = self._priority(lvl)
 
         desc = rule.get("description", "N/A")
-        rid  = str(rule.get("id", "N/A"))
+        rid = str(rule.get("id", "N/A"))
+        groups = ", ".join(rule.get("groups", []) or [])
         agent_name = agent.get("name", "manager")
-        agent_ip   = agent.get("ip", "N/A")
+        agent_ip = agent.get("ip", "N/A")
         ts = self._format_time(alert.get("timestamp", ""))
-        full_log = (alert.get("full_log") or "(N/A)").strip()
+
+        vt_link = ""
+        try:
+            vt_link = (data.get("virustotal", {}) or {}).get("permalink", "") or ""
+        except Exception:
+            pass
+
+        full_log = (alert.get("full_log") or "").strip() or "(N/A)"
         if len(full_log) > 900:
             full_log = full_log[:900] + "…"
+
+        dashboard_url = self._build_dashboard_url(alert)
+
+        facts = [
+            {"title": "Level", "value": f"{pr_txt} ({lvl})"},
+            {"title": "Rule ID", "value": rid},
+            {"title": "Description", "value": desc},
+            {"title": "Groups", "value": groups or "N/A"},
+            {"title": "Agent", "value": f"{agent_name} ({agent_ip})"},
+            {"title": "Timestamp", "value": ts},
+            {"title": "Alert ID", "value": str(alert.get("id", "N/A"))},
+        ]
+        if vt_link:
+            facts.append({"title": "VirusTotal", "value": vt_link})
 
         adaptive_card = {
             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -101,16 +191,7 @@ class Integration:
                     "size": "Large",
                     "color": pr_clr,
                 },
-                {
-                    "type": "FactSet",
-                    "facts": [
-                        {"title": "Level", "value": f"{pr_txt} ({lvl})"},
-                        {"title": "Rule ID", "value": rid},
-                        {"title": "Description", "value": desc},
-                        {"title": "Agent", "value": f"{agent_name} ({agent_ip})"},
-                        {"title": "Timestamp", "value": ts},
-                    ],
-                },
+                {"type": "FactSet", "facts": facts},
                 {
                     "type": "TextBlock",
                     "text": full_log,
@@ -120,9 +201,16 @@ class Integration:
                     "fontType": "Monospace",
                 },
             ],
+            "actions": [
+                {"type": "Action.OpenUrl", "title": "Dashboard", "url": dashboard_url}
+            ],
         }
 
-        # IMPORTANT: Flow expects "type":"message" + attachments with AdaptiveCard content
+        if vt_link:
+            adaptive_card["actions"].append(
+                {"type": "Action.OpenUrl", "title": "VirusTotal", "url": vt_link}
+            )
+
         return {
             "type": "message",
             "attachments": [
@@ -156,18 +244,20 @@ class Integration:
 
         alert_level = int((alert.get("rule", {}) or {}).get("level", 0))
         if alert_level < self.min_level:
-            self.logger.info(f"custom-teams: Skipped (alert level {alert_level} < configured {self.min_level})")
+            self.logger.info(
+                f"custom-teams: Skipped (alert level {alert_level} < configured {self.min_level})"
+            )
             sys.exit(0)
 
         payload = self._make_payload(alert)
         ok = self._send(payload)
         sys.exit(0 if ok else 1)
 
+
 def parse_args(argv):
     alert_file = None
     webhook = None
     level = None
-
     for arg in argv[1:]:
         if arg.startswith("/tmp/") and arg.endswith(".alert"):
             alert_file = arg
@@ -178,16 +268,16 @@ def parse_args(argv):
                 level = int(arg)
             except Exception:
                 pass
-
     return alert_file, webhook, level
+
 
 def main():
     af, wh, lv = parse_args(sys.argv)
     if not af or not wh:
         print("Usage: custom-teams.py <alert_file.alert> <webhook_url> [min_level]")
         sys.exit(1)
-
     Integration(af, wh, lv).run()
+
 
 if __name__ == "__main__":
     main()
